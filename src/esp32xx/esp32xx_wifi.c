@@ -20,11 +20,12 @@
 
 #include "dhcpserver/dhcpserver.h"
 #include "dhcpserver/dhcpserver_options.h"
+#include "esp_eap_client.h"
 #include "esp_netif.h"
 #include "esp_netif_types.h"
+#include "esp_private/wifi_os_adapter.h"
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
-#include "esp_wpa2.h"
 #include "lwip/ip_addr.h"
 
 #include "common/cs_dbg.h"
@@ -51,6 +52,7 @@ static bool s_inited = false;
 static bool s_started = false;
 static bool s_connecting = false;
 static bool s_ap_nat_enable = false;
+static dhcps_t *s_dns_server = NULL;
 
 static esp_err_t esp32xx_wifi_add_mode(wifi_mode_t mode);
 static esp_err_t esp32xx_wifi_remove_mode(wifi_mode_t mode);
@@ -62,9 +64,9 @@ static void esp32xx_wifi_ap_update_dns(void) {
     const char *dns = (mgos_get_mgr()->nameserver
                            ?: CS_STRINGIFY_MACRO(MGOS_DEFAULT_NAMESERVER));
     ipaddr_aton(dns, &dns_ip);
-    dhcps_dns_setserver(&dns_ip);
+    dhcps_dns_setserver(s_dns_server, &dns_ip);
   }
-  dhcps_set_option_info(DOMAIN_NAME_SERVER, &v, sizeof(v));
+  dhcps_set_option_info(s_dns_server, DOMAIN_NAME_SERVER, &v, sizeof(v));
 }
 
 static void esp32xx_wifi_ap_enable_nat(void *arg UNUSED_ARG) {
@@ -444,20 +446,20 @@ bool mgos_wifi_dev_sta_setup(const struct mgos_config_wifi_sta *cfg) {
 
     if (user == NULL) user = "";
 
-    esp_wifi_sta_wpa2_ent_set_username((unsigned char *) user, strlen(user));
+    esp_eap_client_set_username((unsigned char *) user, strlen(user));
 
     if (!mgos_conf_str_empty(cfg->anon_identity)) {
-      esp_wifi_sta_wpa2_ent_set_identity((unsigned char *) cfg->anon_identity,
-                                         strlen(cfg->anon_identity));
+      esp_eap_client_set_identity((unsigned char *) cfg->anon_identity,
+                                  strlen(cfg->anon_identity));
     } else {
       /* By default, username is used. */
-      esp_wifi_sta_wpa2_ent_set_identity((unsigned char *) user, strlen(user));
+      esp_eap_client_set_identity((unsigned char *) user, strlen(user));
     }
     if (!mgos_conf_str_empty(cfg->pass)) {
-      esp_wifi_sta_wpa2_ent_set_password((unsigned char *) cfg->pass,
-                                         strlen(cfg->pass));
+      esp_eap_client_set_password((unsigned char *) cfg->pass,
+                                  strlen(cfg->pass));
     } else {
-      esp_wifi_sta_wpa2_ent_clear_password();
+      esp_eap_client_clear_password();
     }
 
     if (!mgos_conf_str_empty(cfg->ca_cert)) {
@@ -473,10 +475,10 @@ bool mgos_wifi_dev_sta_setup(const struct mgos_config_wifi_sta *cfg) {
        * Luckily, cs_read_file is nice enough to NUL-terminate the data for us
        * (just in case) though it returns size without the NUL.
        * Hence the len + 1 below. */
-      esp_wifi_sta_wpa2_ent_set_ca_cert((unsigned char *) s_ca_cert_pem,
-                                        (int) len + 1);
+      esp_eap_client_set_ca_cert((unsigned char *) s_ca_cert_pem,
+                                 (int) len + 1);
     } else {
-      esp_wifi_sta_wpa2_ent_clear_ca_cert();
+      esp_eap_client_clear_ca_cert();
     }
 
     if (!mgos_conf_str_empty(cfg->cert) && !mgos_conf_str_empty(cfg->key)) {
@@ -493,19 +495,19 @@ bool mgos_wifi_dev_sta_setup(const struct mgos_config_wifi_sta *cfg) {
         LOG(LL_ERROR, ("Failed to read %s", cfg->key));
         goto out;
       }
-      esp_wifi_sta_wpa2_ent_set_cert_key(
+      esp_eap_client_set_certificate_and_key(
           (unsigned char *) s_cert_pem, (int) cert_len + 1,
           (unsigned char *) s_key_pem, (int) key_len + 1,
           NULL /* private_key_passwd */, 0 /* private_key_passwd_len */);
     } else {
-      esp_wifi_sta_wpa2_ent_clear_cert_key();
+      esp_eap_client_clear_certificate_and_key();
     }
 
-    esp_wifi_sta_wpa2_ent_clear_new_password();
-    esp_wifi_sta_wpa2_ent_set_disable_time_check(true /* disable */);
-    esp_wifi_sta_wpa2_ent_enable();
+    esp_eap_client_clear_new_password();
+    esp_eap_client_set_disable_time_check(true /* disable */);
+    esp_wifi_sta_enterprise_enable();
   } else {
-    esp_wifi_sta_wpa2_ent_disable();
+    esp_wifi_sta_enterprise_disable();
   }
 
   wifi_ps_type_t want_ps_mode =
@@ -604,6 +606,7 @@ bool mgos_wifi_dev_ap_setup(const struct mgos_config_wifi_ap *cfg) {
 #if IP_NAPT
   s_ap_nat_enable = cfg->ipv4_nat_enable;
 #endif
+  s_dns_server = dhcps_new();
   esp32xx_wifi_ap_update_dns();
   esp_wifi_set_inactive_time(WIFI_IF_AP, ESP32_WIFI_AP_CLIENT_TIMEOUT_SEC);
   if ((r = esp_netif_dhcps_start(ap_if)) != ESP_OK &&
@@ -665,6 +668,7 @@ bool mgos_wifi_dev_get_ip_info(int if_instance,
   esp_netif_t *esp_netif = esp_netif_get_handle_from_ifkey(
       if_instance == 0 ? "WIFI_STA_DEF" : "WIFI_AP_DEF");
   if (esp_netif == NULL) return false;
+
   struct netif *nif = esp_netif_get_lwip_netif(esp_netif);
   const struct mgos_config_wifi_sta *cfg = mgos_wifi_get_connected_sta_cfg();
   return mgos_lwip_if_get_ip_info(nif, (cfg ? cfg->nameserver : NULL), ip_info);
